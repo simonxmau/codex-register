@@ -444,17 +444,24 @@ class RegistrationEngine:
         try:
             code_body = f'{{"code":"{code}"}}'
 
+            headers = {
+                "referer": "https://auth.openai.com/email-verification",
+                "origin": "https://auth.openai.com",
+                "accept": "application/json",
+                "content-type": "application/json",
+            }
+
             response = self.session.post(
                 OPENAI_API_ENDPOINTS["validate_otp"],
-                headers={
-                    "referer": "https://auth.openai.com/email-verification",
-                    "accept": "application/json",
-                    "content-type": "application/json",
-                },
+                headers=headers,
                 data=code_body,
             )
 
             self._log(f"验证码校验状态: {response.status_code}")
+            
+            if response.status_code != 200:
+                self._log(f"校验失败响应内容: {response.text[:500]}", "warning")
+                
             return response.status_code == 200
 
         except Exception as e:

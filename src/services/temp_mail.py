@@ -8,7 +8,7 @@ import re
 import time
 import json
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 from .base import BaseEmailService, EmailServiceError, EmailServiceType
 from ..core.http_client import HTTPClient, RequestConfig
@@ -25,7 +25,7 @@ class TempMailService(BaseEmailService):
     不走代理，不使用 requests 库
     """
 
-    def __init__(self, config: Dict[str, Any] = None, name: str = None):
+    def __init__(self, config: Optional[Dict[str, Any]] = None, name: Optional[str] = None):
         """
         初始化 TempMail 服务
 
@@ -40,6 +40,9 @@ class TempMailService(BaseEmailService):
             name: 服务名称
         """
         super().__init__(EmailServiceType.TEMP_MAIL, name)
+
+        if config and 'domain' not in config and 'default_domain' in config:
+            config['domain'] = config['default_domain']
 
         required_keys = ["base_url", "admin_password", "domain"]
         missing_keys = [key for key in required_keys if not (config or {}).get(key)]
@@ -86,7 +89,7 @@ class TempMailService(BaseEmailService):
         Raises:
             EmailServiceError: 请求失败
         """
-        base_url = self.config["base_url"].rstrip("/")
+        base_url = str(self.config["base_url"]).rstrip("/")
         url = f"{base_url}{path}"
 
         # 合并默认 admin headers
@@ -118,7 +121,7 @@ class TempMailService(BaseEmailService):
                 raise
             raise EmailServiceError(f"请求失败: {method} {path} - {e}")
 
-    def create_email(self, config: Dict[str, Any] = None) -> Dict[str, Any]:
+    def create_email(self, config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         通过 admin API 创建临时邮箱
 
@@ -209,22 +212,31 @@ class TempMailService(BaseEmailService):
         while time.time() - start_time < timeout:
             try:
                 if jwt:
+                    logger.info(f"使用用户 JWT 获取邮件列表: {email}")
                     response = self._make_request(
                         "GET",
-                        "/user_api/mails",
+                        "/api/mails",
                         params={"limit": 20, "offset": 0},
-                        headers={"x-user-token": jwt, "Content-Type": "application/json", "Accept": "application/json"},
+                        headers={"Authorization": f"Bearer {jwt}", "Content-Type": "application/json", "Accept": "application/json"},
                     )
                 else:
+                    logger.info(f"使用 Admin API 获取邮件列表: {email}")
                     response = self._make_request(
                         "GET",
                         "/admin/mails",
                         params={"limit": 20, "offset": 0, "address": email},
+                        headers={"x-admin-auth": self.config["admin_password"], "Content-Type": "application/json", "Accept": "application/json"},
                     )
 
                 # /user_api/mails 和 /admin/mails 返回格式相同: {"results": [...], "total": N}
-                mails = response.get("results", [])
+                mails = response.get("results")
+                if mails is None:
+                    logger.info(f"API 响应中找不到 'results' 键: {response}")
+                    time.sleep(3)
+                    continue
+
                 if not isinstance(mails, list):
+                    logger.info(f"API 响应的 'results' 不是列表: {type(mails)}")
                     time.sleep(3)
                     continue
 
@@ -235,33 +247,97 @@ class TempMailService(BaseEmailService):
 
                     seen_mail_ids.add(mail_id)
 
-                    sender = str(mail.get("source", "")).lower()
-                    subject = str(mail.get("subject", ""))
-                    body_text = str(mail.get("text", "") or mail.get("html", "") or "")
+                    # 提取关键字段
+                    sender = str(mail.get("source", "") or mail.get("from", "")).lower()
+                    raw_content = str(mail.get("raw", ""))
+                    
+                    # 尝试从 raw 中提取 Subject (因为列表可能不带它)
+                    subject = ""
+                    subject_match = re.search(r"(?i)^Subject:\s*(.*)$", raw_content, re.MULTILINE)
+                    if subject_match:
+                        subject = subject_match.group(1).strip()
+                    else:
+                        subject = str(mail.get("subject", ""))
 
-                    # 去除简单 HTML 标签
-                    body_clean = re.sub(r"<[^>]+>", " ", body_text)
-
-                    content = f"{sender} {subject} {body_clean}"
-
-                    # 只处理 OpenAI 邮件
-                    if "openai" not in sender and "openai" not in content.lower():
-                        continue
-
-                    match = re.search(pattern, content)
-                    if match:
-                        code = match.group(1)
-                        logger.info(f"从 TempMail 邮箱 {email} 找到验证码: {code}")
+                    # 1. 优先从主题匹配 (这是最准的)
+                    # OpenAI 主题通常是: Your ChatGPT code is 123456
+                    code_in_subject = re.search(r"code is\s*(\d{6})", subject, re.I)
+                    if code_in_subject:
+                        code = code_in_subject.group(1)
+                        logger.info(f"从邮件 [Subject] 成功提取到验证码: {code} (ID: {mail_id})")
                         self.update_status(True)
                         return code
 
+                    # 2. 如果主题没匹配到，处理正文
+                    body_text = str(mail.get("text", "") or mail.get("html", "") or "")
+                    # 清理 HTML
+                    body_clean = re.sub(r"<[^>]+>", " ", body_text + " " + raw_content)
+                    
+                    # 检查是否包含关键字，防止误杀
+                    if "openai" not in sender and "openai" not in body_clean.lower():
+                        continue
+
+                    # 只在包含 "verification code" 或 "code to continue" 的上下文里匹配
+                    # 以防误匹配到 raw 中的时间戳 ID
+                    strict_match = re.search(r"(?:code\s*is|code\s*to\s*continue)[^\d]*(\d{6})", body_clean, re.I)
+                    if not strict_match:
+                        # 兜底：使用通用正则，但仅限 body 中间区域
+                        strict_match = re.search(pattern, body_clean)
+
+                    if strict_match:
+                        code = strict_match.group(1)
+                        logger.info(f"从邮件 [Body] 成功提取到验证码: {code} (ID: {mail_id})")
+                        self.update_status(True)
+                        return code
+                    else:
+                        logger.info(f"邮件 {mail_id} 疑似 OpenAI 验证码邮件，但未能提取出 6 位数字")
+
             except Exception as e:
-                logger.debug(f"检查 TempMail 邮件时出错: {e}")
+                logger.info(f"获取验证码轮询波出错: {e}")
 
             time.sleep(3)
 
         logger.warning(f"等待 TempMail 验证码超时: {email}")
         return None
+
+    def list_emails(self, **kwargs) -> List[Dict[str, Any]]:
+        """
+        列出所有缓存的邮箱
+
+        Note:
+            Temp-Mail (自部署) 目前返回缓存的邮箱
+        """
+        return list(self._email_cache.values())
+
+    def delete_email(self, email_id: str) -> bool:
+        """
+        删除邮箱
+
+        Args:
+            email_id: 邮箱服务中的 ID (对应邮箱地址)
+
+        Returns:
+            是否删除成功
+        """
+        # 从缓存中查找并移除
+        if email_id in self._email_cache:
+            self._email_cache.pop(email_id, None)
+            logger.info(f"从缓存中移除 TempMail 邮箱: {email_id}")
+            return True
+
+        # 如果 service_id 不是 email，尝试遍历查找
+        email_to_delete = None
+        for email, info in self._email_cache.items():
+            if info.get("service_id") == email_id or info.get("id") == email_id:
+                email_to_delete = email
+                break
+
+        if email_to_delete:
+            self._email_cache.pop(email_to_delete, None)
+            logger.info(f"从缓存中移除 TempMail 邮箱: {email_to_delete}")
+            return True
+
+        return False
 
     def check_health(self) -> bool:
         """检查服务健康状态"""
